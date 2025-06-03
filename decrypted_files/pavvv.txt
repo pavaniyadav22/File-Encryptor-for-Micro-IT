@@ -1,0 +1,88 @@
+import streamlit as st
+import numpy as np
+import tensorflow as tf
+import cv2
+import matplotlib.pyplot as plt
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.applications.efficientnet import preprocess_input, decode_predictions
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.models import load_model
+from PIL import Image
+import os
+
+IMG_SIZE = 224
+
+# === Build Model with Transfer Learning ===
+@st.cache_resource
+def load_fracture_model():
+    base_model = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(128, activation='relu')(x)
+    predictions = Dense(1, activation='sigmoid')(x)
+    model = Model(inputs=base_model.input, outputs=predictions)
+
+    # Load your fine-tuned weights if available
+    if os.path.exists("fracture_model_tf.h5"):
+        model.load_weights("fracture_model_tf.h5")
+
+    return model
+
+model = load_fracture_model()
+
+# === Grad-CAM Function ===
+def get_gradcam(img_array, model, last_conv_layer_name="top_conv"):
+    grad_model = Model([model.inputs], [model.get_layer(last_conv_layer_name).output, model.output])
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        loss = predictions[:, 0]
+
+    grads = tape.gradient(loss, conv_outputs)[0]
+    conv_outputs = conv_outputs[0]
+    weights = tf.reduce_mean(grads, axis=(0, 1))
+    cam = np.zeros(conv_outputs.shape[0:2], dtype=np.float32)
+
+    for i, w in enumerate(weights):
+        cam += w * conv_outputs[:, :, i]
+
+    cam = np.maximum(cam, 0)
+    cam = cam / cam.max()
+    cam = cv2.resize(cam.numpy(), (IMG_SIZE, IMG_SIZE))
+    return cam
+
+# === Predict + Grad-CAM ===
+def predict_fracture(img: Image.Image):
+    img_resized = img.resize((IMG_SIZE, IMG_SIZE))
+    img_array = image.img_to_array(img_resized)
+    img_array = preprocess_input(img_array)
+    img_array_expanded = np.expand_dims(img_array, axis=0)
+
+    prediction = model.predict(img_array_expanded)[0][0]
+    gradcam = get_gradcam(img_array_expanded, model)
+
+    return prediction, gradcam
+
+# === Streamlit UI ===
+st.set_page_config(page_title="Palm/Finger Fracture Detection", layout="centered")
+st.title("🩻 Palm & Finger Fracture Detection")
+st.caption("Upload an X-ray image. The AI will detect fractures and highlight the region using Grad-CAM.")
+
+uploaded_file = st.file_uploader("Upload X-ray Image", type=["jpg", "jpeg", "png"])
+
+if uploaded_file:
+    image_pil = Image.open(uploaded_file).convert("RGB")
+    st.image(image_pil, caption="Uploaded Image", use_column_width=True)
+
+    if st.button("🔍 Detect Fracture"):
+        with st.spinner("Analyzing..."):
+            prediction, gradcam = predict_fracture(image_pil)
+            label = "🟥 Fracture Detected" if prediction > 0.5 else "✅ No Fracture"
+            st.markdown(f"### Result: *{label}* ({prediction:.2f})")
+
+            # Show Grad-CAM
+            gradcam_colored = cv2.applyColorMap(np.uint8(255 * gradcam), cv2.COLORMAP_JET)
+            original = cv2.resize(np.array(image_pil), (IMG_SIZE, IMG_SIZE))
+            superimposed_img = cv2.addWeighted(original, 0.6, gradcam_colored, 0.4, 0)
+            st.image(superimposed_img, caption="Grad-CAM Heatmap", use_column_width=True)
